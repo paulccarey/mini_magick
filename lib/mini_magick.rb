@@ -1,18 +1,10 @@
 require 'tempfile'
+require 'subexec'
 
 module MiniMagick
   class << self
     attr_accessor :processor
-    attr_accessor :use_subexec
     attr_accessor :timeout
-  end
-  
-  MOGRIFY_COMMANDS = %w{adaptive-blur adaptive-resize adaptive-sharpen adjoin affine alpha annotate antialias append authenticate auto-gamma auto-level auto-orient background bench iterations bias black-threshold blue-primary point blue-shift factor blur border bordercolor brightness-contrast caption string cdl filename channel type charcoal radius chop clip clamp clip-mask filename clip-path id clone index clut contrast-stretch coalesce colorize color-matrix colors colorspace type combine comment string compose operator composite compress type contrast convolve coefficients crop cycle amount decipher filename debug events define format:option deconstruct delay delete index density depth despeckle direction type display server dispose method distort type coefficients dither method draw string edge radius emboss radius encipher filename encoding type endian type enhance equalize evaluate operator evaluate-sequence operator extent extract family name fft fill filter type flatten flip floodfill flop font name format string frame function name fuzz distance fx expression gamma gaussian-blur geometry gravity type green-primary point help identify ifft implode amount insert index intent type interlace type interline-spacing interpolate method interword-spacing kerning label string lat layers method level limit type linear-stretch liquid-rescale log format loop iterations mask filename mattecolor median radius modulate monitor monochrome morph morphology method kernel motion-blur negate noise radius normalize opaque ordered-dither NxN orient type page paint radius ping pointsize polaroid angle posterize levels precision preview type print string process image-filter profile filename quality quantizespace quiet radial-blur angle raise random-threshold low,high red-primary point regard-warnings region remap filename render repage resample resize respect-parentheses roll rotate degrees sample sampling-factor scale scene seed segments selective-blur separate sepia-tone threshold set attribute shade degrees shadow sharpen shave shear sigmoidal-contrast size sketch solarize threshold splice spread radius strip stroke strokewidth stretch type style type swap indexes swirl degrees texture filename threshold thumbnail tile filename tile-offset tint transform transparent transparent-color transpose transverse treedepth trim type type undercolor unique-colors units type unsharp verbose version view vignette virtual-pixel method wave weight type white-point point white-threshold write filename}
-  
-  # Subexec only works with 1.9
-  if RUBY_VERSION[0..2].to_f < 1.8
-    self.use_subexec = true
-    require 'subexec'
   end
   
   class Error < RuntimeError; end
@@ -75,12 +67,7 @@ module MiniMagick
         # Get the EXIF original capture as a Time object
         Time.local(*self["EXIF:DateTimeOriginal"].split(/:|\s+/)) rescue nil
       when /^EXIF\:/i
-        result = run_command('identify', '-format', "\"%[#{value}]\"", @path).chop
-        if result.include?(",")
-          read_character_data(result)
-        else
-          result
-        end
+        run_command('identify', '-format', "\"%[#{value}]\"", @path).chop
       else
         run_command('identify', '-format', "\"#{value}\"", @path).split("\n")[0]
       end
@@ -139,13 +126,9 @@ module MiniMagick
     # If an unknown method is called then it is sent through the morgrify program
     # Look here to find all the commands (http://www.imagemagick.org/script/mogrify.php)
     def method_missing(symbol, *args)
-      if MOGRIFY_COMMANDS.include?(symbol.to_s)
-        args.push(@path) # push the path onto the end
-        run_command("mogrify", "-#{symbol}", *args)
-        self
-      else
-        super(symbol, *args)
-      end
+      args.push(@path) # push the path onto the end
+      run_command("mogrify", "-#{symbol}", *args)
+      self
     end
 
     # You can use multiple commands together using this method
@@ -176,30 +159,22 @@ module MiniMagick
       end
 
       command = "#{MiniMagick.processor} #{command} #{args.join(' ')}".strip
-
-      if ::MiniMagick.use_subexec
-        sub = Subexec.run(command, :timeout => MiniMagick.timeout)
-        exit_status = sub.exitstatus
-        output = sub.output
-      else
-        output = `#{command} 2>&1`
-        exit_status = $?.exitstatus
-      end
-
-      if exit_status != 0
+      sub = Subexec.run(command, :timeout => MiniMagick.timeout)
+      
+      if sub.exitstatus != 0
         # Clean up after ourselves in case of an error
         destroy!
         
         # Raise the appropriate error
-        if output =~ /no decode delegate/i || output =~ /did not return an image/i
-          raise Invalid, output
+        if sub.output =~ /no decode delegate/i || sub.output =~ /did not return an image/i
+          raise Invalid, sub.output
         else
           # TODO: should we do something different if the command times out ...?
           # its definitely better for logging.. otherwise we dont really know
-          raise Error, "Command (#{command.inspect}) failed: #{{:status_code => exit_status, :output => output}.inspect}"
+          raise Error, "Command (#{command.inspect}) failed: #{{:status_code => sub.exitstatus, :output => sub.output}.inspect}"
         end
       else
-        output
+        sub.output
       end
     end
     
@@ -208,17 +183,53 @@ module MiniMagick
       File.unlink(tempfile.path)
       @tempfile = nil
     end
+  end
+
+  # Composes two images together via ImageMagick's 'composite' script
+  class Composite
     
-    private
-      # Sometimes we get back a list of character values
-      def read_character_data(list_of_characters)
-        chars = list_of_characters.gsub(" ", "").split(",")
-        result = ""
-        chars.each do |val|
-          result << ("%c" % val.to_i)
-        end
-        result
+    # Class Methods
+    # -------------
+    
+    # To create a composite simply call Composite.new with the images you want composite,
+    # the path to the output file and any command line options you may want. Note that the
+    # images should be passed in the order you want them stacked (first image is on top, second
+    # image is in back). You will be returned a MiniMagick::Image instance for the new composited image:
+    #
+    #   image1 = MiniMagick::Image.open('foreground.png')
+    #   image2 = MiniMagick::Image.open('background.png')
+    #   output_image = MiniMagick::Composite.new(image1, image2, 'jpg', :gravity => 'NorthEast')
+    #   output_image.write('combined_image.jpg')
+    #
+    # The above example would combine the two images into a new JPEG file and, if the two images are 
+    # different sizes it will stick the top image into the upper right (north east) corner of the bottom image.
+    # The the image is saved using the standard Image.save method.
+    #
+    # The 'composite' script has several options, see here: http://www.imagemagick.org/script/composite.php
+    def self.new(*args)
+
+      image1 = args[0]
+      image2 = args[1]
+      output_extension = args[2] || 'jpg'
+      opts = args[3] || {}
+      
+      begin
+        tempfile = ImageTempFile.new(output_extension)
+        tempfile.binmode
+      ensure
+        tempfile.close
       end
+      
+      args = opts.collect { |key,value| "-#{key.to_s} #{value.to_s}" }  # collect hash parts into arguments
+      args.push(image1.path)
+      args.push(image2.path)
+      args.push(tempfile.path)
+
+      CommandRunner::run('composite',*args)
+      
+      return Image.open(tempfile.path)
+    end
+    
   end
 
   class CommandBuilder
@@ -235,6 +246,45 @@ module MiniMagick
 
     def +(value)
       @args << "+#{value}"
+    end
+  end
+end
+
+
+  # Does the job of running commands in the shell.
+  class CommandRunner
+    
+    # Class Methods
+    # -------------
+    def self.run(command, *args)
+      args.collect! do |arg|        
+        # args can contain characters like '>' so we must escape them, but don't quote switches
+        if arg !~ /^\+|\-/
+          "\"#{arg}\""
+        else
+          arg.to_s
+        end
+      end
+
+      command = "#{command} #{args.join(' ')}"
+      output = `#{command} 2>&1`
+
+      if $?.exitstatus != 0
+        raise MiniMagickError, "ImageMagick command (#{command.inspect}) failed: #{{:status_code => $?, :output => output}.inspect}"
+      else
+        output
+      end
+    end
+    
+  end
+
+
+require "tempfile"
+
+module MiniMagick
+  class ImageTempFile < Tempfile
+    def make_tmpname(ext, n)
+      'mini_magick%d-%d%s' % [$$, n, ext ? ".#{ext}" : '']
     end
   end
 end
